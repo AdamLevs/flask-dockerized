@@ -1,41 +1,45 @@
-import sqlite3
-
+import os
 import click
-from flask import current_app
-from flask import g
+import psycopg2
+import psycopg2.extras
+from urllib.parse import urlparse
+from flask import current_app, g
 from flask.cli import with_appcontext
+from werkzeug.security import generate_password_hash
 
 
 def get_db():
-    """Connect to the application's configured database. The connection
-    is unique for each request and will be reused if this is called
-    again.
-    """
     if "db" not in g:
-        g.db = sqlite3.connect(
-            current_app.config["DATABASE"], detect_types=sqlite3.PARSE_DECLTYPES
+        db_url = os.getenv("DATABASE_URL")
+        if not db_url:
+            raise RuntimeError("DATABASE_URL is not set")
+
+        result = urlparse(db_url)
+
+        g.db = psycopg2.connect(
+            dbname=result.path[1:],
+            user=result.username,
+            password=result.password,
+            host=result.hostname,
+            port=result.port,
+            cursor_factory=psycopg2.extras.RealDictCursor  # 🧠 מחזיר dict לכל שורה
         )
-        g.db.row_factory = sqlite3.Row
 
     return g.db
 
 
 def close_db(e=None):
-    """If this request connected to the database, close the
-    connection.
-    """
     db = g.pop("db", None)
-
     if db is not None:
         db.close()
 
 
 def init_db():
-    """Clear existing data and create new tables."""
     db = get_db()
-
+    cursor = db.cursor()
     with current_app.open_resource("schema.sql") as f:
-        db.executescript(f.read().decode("utf8"))
+        cursor.execute(f.read().decode("utf8"))
+    db.commit()
 
 
 @click.command("init-db")
@@ -46,9 +50,30 @@ def init_db_command():
     click.echo("Initialized the database.")
 
 
+def create_demo_user():
+    db = get_db()
+    cursor = db.cursor()
+    try:
+        cursor.execute(
+            'INSERT INTO "user" (username, password) VALUES (%s, %s)',
+            ("admin", generate_password_hash("admin"))
+        )
+        db.commit()
+        print("▶ Demo user 'admin' created with password 'admin'")
+    except psycopg2.errors.UniqueViolation:
+        db.rollback()
+        print("▶ Demo user already exists. Skipping.")
+
+
+@click.command("init-demo")
+@with_appcontext
+def init_demo_command():
+    """Create a demo user if not exists."""
+    create_demo_user()
+    click.echo("Created demo user.")
+
+
 def init_app(app):
-    """Register database functions with the Flask app. This is called by
-    the application factory.
-    """
     app.teardown_appcontext(close_db)
     app.cli.add_command(init_db_command)
+    app.cli.add_command(init_demo_command)
